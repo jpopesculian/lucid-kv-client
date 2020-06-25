@@ -6,7 +6,7 @@ extern crate failure;
 extern crate fehler;
 
 use bytes::Bytes;
-use reqwest::{Body, Client, Url};
+use reqwest::{Body, Client, StatusCode, Url};
 
 #[cfg(feature = "serde")]
 use serde::{de::DeserializeOwned, Serialize};
@@ -69,13 +69,25 @@ impl LucidClient {
 
     /// Gets raw bytes from a key's value
     #[throws]
-    pub async fn get_raw<K: AsRef<str>>(&self, key: K) -> Bytes {
-        self.client
+    pub async fn get_raw<K: AsRef<str>>(&self, key: K) -> Option<Bytes> {
+        let res = self
+            .client
             .get(self.key_url(key)?)
             .send()
             .await
-            .map_err(Error::InvalidRequest)?
-            .bytes()
+            .map_err(Error::InvalidRequest)?;
+        match res.status() {
+            StatusCode::OK => Some(res.bytes().await.map_err(|_| Error::InvalidResponse)?),
+            StatusCode::NOT_FOUND => None,
+            _ => throw!(Error::InvalidResponse),
+        }
+    }
+
+    #[throws]
+    pub async fn delete<K: AsRef<str>>(&self, key: K) {
+        self.client
+            .delete(self.key_url(key)?)
+            .send()
             .await
             .map_err(Error::InvalidRequest)?
     }
@@ -94,9 +106,14 @@ impl LucidClient {
     /// Get the value for a key and deserialize it into a rust object
     #[cfg(feature = "serde")]
     #[throws]
-    pub async fn get<K: AsRef<str>, V: DeserializeOwned>(&self, key: K) -> V {
-        serde_mod::from_slice(self.get_raw(key).await?.as_ref())
-            .map_err(|_| Error::DeserializeError)?
+    pub async fn get<K: AsRef<str>, V: DeserializeOwned>(&self, key: K) -> Option<V> {
+        let bytes = self.get_raw(key).await?;
+        match bytes {
+            None => None,
+            Some(bytes) => {
+                Some(serde_mod::from_slice(bytes.as_ref()).map_err(|_| Error::DeserializeError)?)
+            }
+        }
     }
 
     #[inline]
@@ -157,7 +174,10 @@ mod tests {
         let test_value = "value1";
         client.put_raw("get_raw", test_value).await?;
         let db_value = client.get_raw("get_raw").await?;
-        assert_eq!(test_value, String::from_utf8_lossy(db_value.as_ref()));
+        assert_eq!(
+            test_value,
+            String::from_utf8_lossy(db_value.unwrap().as_ref())
+        );
         Ok(())
     }
 
@@ -169,12 +189,38 @@ mod tests {
         let test_value1 = "value1";
         client.put_raw(key, test_value1).await?;
         let db_value = client.get_raw(key).await?;
-        assert_eq!(test_value1, String::from_utf8_lossy(db_value.as_ref()));
+        assert_eq!(
+            test_value1,
+            String::from_utf8_lossy(db_value.unwrap().as_ref())
+        );
 
         let test_value2 = "value2";
         client.put_raw(key, test_value2).await?;
         let db_value = client.get_raw(key).await?;
-        assert_eq!(test_value2, String::from_utf8_lossy(db_value.as_ref()));
+        assert_eq!(
+            test_value2,
+            String::from_utf8_lossy(db_value.unwrap().as_ref())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete() -> Result<(), Error> {
+        let client = client()?;
+        let key = "delete";
+
+        let test_value = "value";
+        client.put_raw(key, test_value).await?;
+        let db_value = client.get_raw(key).await?;
+        assert_eq!(
+            test_value,
+            String::from_utf8_lossy(db_value.unwrap().as_ref())
+        );
+
+        client.delete(key).await?;
+        let db_value = client.get_raw(key).await?;
+        assert!(db_value.is_none());
 
         Ok(())
     }
@@ -203,7 +249,7 @@ mod tests {
         };
         client.put("get", &test_value).await?;
         let db_value = client.get("get").await?;
-        assert_eq!(test_value, db_value);
+        assert_eq!(Some(test_value), db_value);
         Ok(())
     }
 }
