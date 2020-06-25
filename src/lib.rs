@@ -20,12 +20,23 @@ pub enum Error {
     InvalidResponse,
     #[fail(display = "invalid request: {}", _0)]
     InvalidRequest(reqwest::Error),
+    #[fail(display = "unauthorized")]
+    Unauthorized,
+    #[fail(display = "conflict")]
+    Conflict,
     #[cfg(feature = "serde")]
     #[fail(display = "serialize error")]
     SerializeError,
     #[cfg(feature = "serde")]
     #[fail(display = "deserialize error")]
     DeserializeError,
+}
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PutStatus {
+    Ok,
+    Created,
 }
 
 /// The main Client
@@ -58,13 +69,21 @@ impl LucidClient {
 
     /// Store a string or bytes as a value for a key. Creates a new key if it does not exist
     #[throws]
-    pub async fn put_raw<K: AsRef<str>, V: Into<Body>>(&self, key: K, value: V) {
-        self.client
+    pub async fn put_raw<K: AsRef<str>, V: Into<Body>>(&self, key: K, value: V) -> PutStatus {
+        let res = self
+            .client
             .put(self.key_url(key)?)
             .body(value)
             .send()
             .await
             .map_err(Error::InvalidRequest)?;
+        match res.status() {
+            StatusCode::OK => PutStatus::Ok,
+            StatusCode::CREATED => PutStatus::Created,
+            StatusCode::UNAUTHORIZED => throw!(Error::Unauthorized),
+            StatusCode::CONFLICT => throw!(Error::Conflict),
+            _ => throw!(Error::InvalidResponse),
+        }
     }
 
     /// Gets raw bytes from a key's value
@@ -83,19 +102,44 @@ impl LucidClient {
         }
     }
 
+    /// Delete a key's value
     #[throws]
-    pub async fn delete<K: AsRef<str>>(&self, key: K) {
-        self.client
+    pub async fn delete<K: AsRef<str>>(&self, key: K) -> bool {
+        let res = self
+            .client
             .delete(self.key_url(key)?)
             .send()
             .await
-            .map_err(Error::InvalidRequest)?
+            .map_err(Error::InvalidRequest)?;
+        match res.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => true,
+            StatusCode::NOT_FOUND => false,
+            StatusCode::UNAUTHORIZED => throw!(Error::Unauthorized),
+            _ => throw!(Error::InvalidResponse),
+        }
+    }
+
+    /// Check if a key exists
+    #[throws]
+    pub async fn exists<K: AsRef<str>>(&self, key: K) -> bool {
+        let res = self
+            .client
+            .head(self.key_url(key)?)
+            .send()
+            .await
+            .map_err(Error::InvalidRequest)?;
+        match res.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => true,
+            StatusCode::NOT_FOUND => false,
+            StatusCode::UNAUTHORIZED => throw!(Error::Unauthorized),
+            _ => throw!(Error::InvalidResponse),
+        }
     }
 
     /// Serialize a rust object and store as the value for a key
     #[cfg(feature = "serde")]
     #[throws]
-    pub async fn put<K: AsRef<str>, V: Serialize>(&self, key: K, value: &V) {
+    pub async fn put<K: AsRef<str>, V: Serialize>(&self, key: K, value: &V) -> PutStatus {
         self.put_raw(
             key,
             serde_mod::to_vec(value).map_err(|_| Error::SerializeError)?,
@@ -206,6 +250,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_missing() -> Result<(), Error> {
+        let client = client()?;
+        assert!(!client.delete("delete_missing").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn delete() -> Result<(), Error> {
         let client = client()?;
         let key = "delete";
@@ -218,10 +269,25 @@ mod tests {
             String::from_utf8_lossy(db_value.unwrap().as_ref())
         );
 
-        client.delete(key).await?;
+        assert!(client.delete(key).await?);
         let db_value = client.get_raw(key).await?;
         assert!(db_value.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exists_false() -> Result<(), Error> {
+        let client = client()?;
+        assert!(!client.exists("exists_false").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exists_true() -> Result<(), Error> {
+        let client = client()?;
+        client.put_raw("exists_true", "value").await?;
+        assert!(client.exists("exists_true").await?);
         Ok(())
     }
 
