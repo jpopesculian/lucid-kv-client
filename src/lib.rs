@@ -1,11 +1,10 @@
 //! A simple Client for the Lucid KV
 //!
 //! Currently supports operations for `get`, `put`, `delete` and `exists`.
+//!
 //! `lock`, `unlock`, `increment`, `decrement` and `ttl` are still being implemented.
 //!
 //! Notifications currently unsupported
-//!
-//! Authorization currently unsupported
 
 #[macro_use]
 extern crate failure;
@@ -53,6 +52,7 @@ pub enum Error {
     InvalidJWTKey,
 }
 
+/// Whether a Key was created or not
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PutStatus {
@@ -160,7 +160,7 @@ impl LucidClient {
         }
     }
 
-    /// Delete a key's value
+    /// Delete a key's value. Returns `true` if the key existed and was actually deleted
     #[throws]
     pub async fn delete<K: AsRef<str>>(&self, key: K) -> bool {
         let res = self
