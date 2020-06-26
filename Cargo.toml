@@ -13,21 +13,20 @@ keywords = ["lucid", "kv", "database", "client", "api"]
 categories = ["database", "web-programming::http-client", "api-bindings"]
 
 [features]
-default = ["rustls-tls", "serde-flexbuffers"]
+default = ["rustls-tls"]
 rustls-tls = ["reqwest/rustls-tls"]
-serde-json = ["serde", "serde_json"]
-serde-flexbuffers = ["serde", "flexbuffers"]
 
 [dependencies]
 failure = "0.1"
 fehler = "1.0"
 flexbuffers = { version = "0.1", optional = true }
 reqwest = { version = "0.10.6", default-features = false }
-serde = { version = "1.0", optional = true, features = ["derive"] }
-serde_json = { version = "1.0", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
 percent-encoding = "2.1.0"
 bytes = "0.5.5"
 cfg-if = "0.1.10"
+jsonwebtoken = "7.1.2"
 
 [dev-dependencies]
 tokio = { version = "0.2", features = ["full"] }

@@ -3,18 +3,30 @@
 //! Currently supports operations for `get`, `put`, `delete` and `exists`.
 //! `lock`, `unlock`, `increment`, `decrement` and `ttl` are still being implemented.
 //!
-//! At the moment there is no support for Authorization.
+//! Notifications currently unsupported
+//!
+//! Authorization currently unsupported
 
 #[macro_use]
 extern crate failure;
+
 #[macro_use]
 extern crate fehler;
 
 use bytes::Bytes;
+use jsonwebtoken::EncodingKey;
+use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Body, Client, StatusCode, Url};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "serde")]
-use serde::{de::DeserializeOwned, Serialize};
+cfg_if::cfg_if! {
+    if #[cfg(feature = "flexbuffers")] {
+        use flexbuffers as serde_mod;
+    } else {
+        use serde_json as serde_mod;
+    }
+}
 
 /// Errors when doing Client operations
 #[derive(Fail, Debug)]
@@ -29,12 +41,12 @@ pub enum Error {
     Unauthorized,
     #[fail(display = "conflict")]
     Conflict,
-    #[cfg(feature = "serde")]
     #[fail(display = "serialize error")]
     SerializeError,
-    #[cfg(feature = "serde")]
     #[fail(display = "deserialize error")]
     DeserializeError,
+    #[fail(display = "invalid JWT key")]
+    InvalidJWTKey,
 }
 
 #[repr(u16)]
@@ -44,32 +56,36 @@ pub enum PutStatus {
     Created,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct Claims {
+    pub sub: String,
+    pub iss: String,
+    pub iat: i64,
+    pub exp: i64,
+}
+
 /// The main Client
 #[derive(Clone, Debug)]
 pub struct LucidClient {
     client: Client,
     url: Url,
-}
-
-cfg_if::cfg_if! {
-    if #[cfg(all(feature = "serde-json", feature = "serde-flexbuffers"))] {
-        compile_error!("Cannot use both `serde-json` and `serde-flexbuffers`");
-    } else if #[cfg(feature = "serde-json")] {
-        use serde_json as serde_mod;
-    } else if #[cfg(feature = "serde-flexbuffers")] {
-        use flexbuffers as serde_mod;
-    }
+    jwt_key: Option<EncodingKey>,
 }
 
 impl LucidClient {
     /// Build a Client from a base url (e.g. `"http://localhost:7020"`)
     #[throws]
-    pub fn build<U: AsRef<str>>(base_url: U) -> Self {
+    pub fn build<U: AsRef<str>, S: AsRef<[u8]>>(base_url: U, jwt_key: Option<S>) -> Self {
         let client = Client::new();
         let url = Url::parse(base_url.as_ref())
             .and_then(|url| url.join("api/kv/"))
             .map_err(|_| Error::InvalidUrl)?;
-        Self { client, url }
+        let jwt_key = jwt_key.map(|s| EncodingKey::from_secret(s.as_ref()));
+        Self {
+            client,
+            url,
+            jwt_key,
+        }
     }
 
     /// Store a string or bytes as a value for a key. Creates a new key if it does not exist
@@ -78,6 +94,7 @@ impl LucidClient {
         let res = self
             .client
             .put(self.key_url(key)?)
+            .headers(self.authorization()?)
             .body(value)
             .send()
             .await
@@ -97,6 +114,7 @@ impl LucidClient {
         let res = self
             .client
             .get(self.key_url(key)?)
+            .headers(self.authorization()?)
             .send()
             .await
             .map_err(Error::InvalidRequest)?;
@@ -113,6 +131,7 @@ impl LucidClient {
         let res = self
             .client
             .delete(self.key_url(key)?)
+            .headers(self.authorization()?)
             .send()
             .await
             .map_err(Error::InvalidRequest)?;
@@ -130,6 +149,7 @@ impl LucidClient {
         let res = self
             .client
             .head(self.key_url(key)?)
+            .headers(self.authorization()?)
             .send()
             .await
             .map_err(Error::InvalidRequest)?;
@@ -142,7 +162,6 @@ impl LucidClient {
     }
 
     /// Serialize a rust object and store as the value for a key
-    #[cfg(feature = "serde")]
     #[throws]
     pub async fn put<K: AsRef<str>, V: Serialize>(&self, key: K, value: &V) -> PutStatus {
         self.put_raw(
@@ -153,7 +172,6 @@ impl LucidClient {
     }
 
     /// Get the value for a key and deserialize it into a rust object
-    #[cfg(feature = "serde")]
     #[throws]
     pub async fn get<K: AsRef<str>, V: DeserializeOwned>(&self, key: K) -> Option<V> {
         let bytes = self.get_raw(key).await?;
@@ -173,16 +191,43 @@ impl LucidClient {
                 .to_string();
         self.url.join(&encoded).map_err(|_| Error::InvalidUrl)?
     }
+
+    #[inline]
+    #[throws]
+    fn authorization(&self) -> HeaderMap<HeaderValue> {
+        let mut headers = HeaderMap::default();
+        let key = if let Some(ref key) = self.jwt_key {
+            key
+        } else {
+            return headers;
+        };
+
+        let iat = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(n) => n.as_secs() as i64,
+            Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+        };
+        let claims = Claims {
+            iat,
+            exp: iat + 60,
+            ..Default::default()
+        };
+        let token = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &claims, &key)
+            .map_err(|_| Error::InvalidJWTKey)?;
+
+        headers.append(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token)
+                .parse()
+                .map_err(|_| Error::InvalidJWTKey)?,
+        );
+        headers
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "serde")]
-    use serde::Deserialize;
-
-    #[cfg(feature = "serde")]
     #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
     struct TestStruct {
         a: u32,
@@ -192,7 +237,8 @@ mod tests {
 
     #[throws]
     fn client() -> LucidClient {
-        LucidClient::build("http://localhost:7020")?
+        // LucidClient::build::<_, [u8; 0]>("http://localhost:7020", None)?
+        LucidClient::build("http://localhost:7020", Some("secret"))?
     }
 
     #[test]
