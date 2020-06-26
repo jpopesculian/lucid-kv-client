@@ -27,6 +27,7 @@ cfg_if::cfg_if! {
     }
 }
 
+#[cfg(feature = "rustls-tls")]
 pub use reqwest::Certificate;
 
 /// Errors when doing Client operations
@@ -95,8 +96,15 @@ impl<'a> Builder<'a> {
     }
 
     /// Add a JWT secret to authenticate against
-    pub fn jwt_key<T: AsRef<[u8]>>(mut self, key: Option<T>) -> Self {
-        self.jwt_key = key.map(|k| EncodingKey::from_secret(k.as_ref()));
+    pub fn add_jwt_key<T: AsRef<[u8]> + ?Sized>(mut self, key: &T) -> Self {
+        self.jwt_key = Some(EncodingKey::from_secret(key.as_ref()));
+        self
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    /// Add a custom root certificate
+    pub fn add_root_certificate(mut self, cert: Certificate) -> Self {
+        self.client = self.client.add_root_certificate(cert);
         self
     }
 
@@ -274,9 +282,20 @@ mod tests {
 
     #[throws]
     fn client() -> LucidClient {
-        LucidClient::builder("http://localhost:7020")
-            .jwt_key(Some("secret"))
-            .build()?
+        #[allow(unused_mut, unused_assignments)]
+        let mut builder = LucidClient::builder("http://localhost:7020");
+        #[cfg(feature = "rustls-tls")]
+        {
+            builder = LucidClient::builder("https://localhost:7021");
+            let ca_cert = Certificate::from_pem(
+                std::fs::read("test_assets/ssl/ca-cert.pem")
+                    .unwrap()
+                    .as_ref(),
+            )
+            .unwrap();
+            builder = builder.add_root_certificate(ca_cert);
+        }
+        builder.add_jwt_key("secret").build()?
     }
 
     #[test]

@@ -1,0 +1,33 @@
+---
+general:
+  bind_address: 127.0.0.1
+  port: 7020
+  port_ssl: 7021
+  use_ssl: true
+  ssl_certificate: "test_assets/ssl/cert.pem"
+  ssl_certificate_key: "test_assets/ssl/key.pem"
+  show_banner: true
+authentication:
+  enabled: true
+  root_token:
+  secret_key: secret
+persistence:
+  enabled: false
+  location: ""
+encryption:
+  enabled: false
+  private_key: 2315f0fd8b66397ee9e67e67ab7cef0dc13119689aea387d
+  iv: 7c9d8895b078741e704e4b1192bf4da3
+sse:
+  enabled: true
+webui:
+  enabled: true
+store:
+  max_limit: 7340032
+http:
+  request_size_limit: 8388608
+logging:
+  level: INFO
+  outputs:
+    - type: stdout
+      colored: true
