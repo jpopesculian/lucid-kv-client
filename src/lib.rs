@@ -16,7 +16,7 @@ extern crate fehler;
 use bytes::Bytes;
 use jsonwebtoken::EncodingKey;
 use reqwest::header::{self, HeaderMap, HeaderValue};
-use reqwest::{Body, Client, StatusCode, Url};
+use reqwest::{Body, Client, ClientBuilder, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,11 +28,15 @@ cfg_if::cfg_if! {
     }
 }
 
+pub use reqwest::Certificate;
+
 /// Errors when doing Client operations
 #[derive(Fail, Debug)]
 pub enum Error {
     #[fail(display = "invalid url")]
     InvalidUrl,
+    #[fail(display = "invalid client")]
+    InvalidClient(reqwest::Error),
     #[fail(display = "invalid response")]
     InvalidResponse,
     #[fail(display = "invalid request: {}", _0)]
@@ -72,20 +76,51 @@ pub struct LucidClient {
     jwt_key: Option<EncodingKey>,
 }
 
-impl LucidClient {
-    /// Build a Client from a base url (e.g. `"http://localhost:7020"`)
-    #[throws]
-    pub fn build<U: AsRef<str>, S: AsRef<[u8]>>(base_url: U, jwt_key: Option<S>) -> Self {
-        let client = Client::new();
-        let url = Url::parse(base_url.as_ref())
-            .and_then(|url| url.join("api/kv/"))
-            .map_err(|_| Error::InvalidUrl)?;
-        let jwt_key = jwt_key.map(|s| EncodingKey::from_secret(s.as_ref()));
+/// A builder for adding custom options to the LucidClient
+#[derive(Debug)]
+pub struct Builder<'a> {
+    client: ClientBuilder,
+    url: &'a str,
+    jwt_key: Option<EncodingKey>,
+}
+
+impl<'a> Builder<'a> {
+    /// Create a new Client Builder with a base URL (e.g. `http://localhost:7020`)
+    pub fn new<U: AsRef<str> + ?Sized>(base_url: &'a U) -> Self {
         Self {
-            client,
-            url,
-            jwt_key,
+            client: ClientBuilder::new(),
+            url: base_url.as_ref(),
+            jwt_key: None,
         }
+    }
+
+    /// Add a JWT secret to authenticate against
+    pub fn jwt_key<T: AsRef<[u8]>>(mut self, key: Option<T>) -> Self {
+        self.jwt_key = key.map(|k| EncodingKey::from_secret(k.as_ref()));
+        self
+    }
+
+    /// Build the LucidClient itself
+    #[throws]
+    pub fn build(self) -> LucidClient {
+        LucidClient {
+            client: self.client.build().map_err(Error::InvalidClient)?,
+            url: Url::parse(self.url).map_err(|_| Error::InvalidUrl)?,
+            jwt_key: self.jwt_key,
+        }
+    }
+}
+
+impl LucidClient {
+    /// Build a basic Client. This is equivalent to `Builder::new(url).build()`
+    #[throws]
+    pub fn new<U: AsRef<str> + ?Sized>(base_url: &U) -> Self {
+        Builder::new(base_url).build()?
+    }
+
+    /// Configure a Client with the Builder
+    pub fn builder<'a, U: AsRef<str> + ?Sized>(base_url: &'a U) -> Builder<'a> {
+        Builder::new(base_url)
     }
 
     /// Store a string or bytes as a value for a key. Creates a new key if it does not exist
@@ -189,7 +224,9 @@ impl LucidClient {
         let encoded =
             percent_encoding::utf8_percent_encode(key.as_ref(), percent_encoding::NON_ALPHANUMERIC)
                 .to_string();
-        self.url.join(&encoded).map_err(|_| Error::InvalidUrl)?
+        self.url
+            .join(&format!("api/kv/{}", encoded))
+            .map_err(|_| Error::InvalidUrl)?
     }
 
     #[inline]
@@ -237,13 +274,15 @@ mod tests {
 
     #[throws]
     fn client() -> LucidClient {
-        // LucidClient::build::<_, [u8; 0]>("http://localhost:7020", None)?
-        LucidClient::build("http://localhost:7020", Some("secret"))?
+        LucidClient::builder("http://localhost:7020")
+            .jwt_key(Some("secret"))
+            .build()?
     }
 
     #[test]
     #[throws]
     fn build() {
+        LucidClient::new("http://localhost:7020")?;
         client()?;
     }
 
