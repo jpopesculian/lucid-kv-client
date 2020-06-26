@@ -1,9 +1,5 @@
 //! A simple Client for the Lucid KV
 //!
-//! Currently supports operations for `get`, `put`, `delete` and `exists`.
-//!
-//! `lock`, `unlock`, `increment`, `decrement` and `ttl` are still being implemented.
-//!
 //! Notifications currently unsupported
 
 #[macro_use]
@@ -16,8 +12,8 @@ use bytes::Bytes;
 use jsonwebtoken::EncodingKey;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Body, Client, ClientBuilder, StatusCode, Url};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{de::DeserializeOwned, ser::Serializer, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "flexbuffers")] {
@@ -45,6 +41,12 @@ pub enum Error {
     Unauthorized,
     #[fail(display = "conflict")]
     Conflict,
+    #[fail(display = "not found")]
+    NotFound,
+    #[fail(display = "non numeric value")]
+    NonNumericValue,
+    #[fail(display = "bad request")]
+    BadRequest,
     #[fail(display = "serialize error")]
     SerializeError,
     #[fail(display = "deserialize error")]
@@ -61,12 +63,27 @@ pub enum PutStatus {
     Created,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
+enum Operation {
+    Lock,
+    Unlock,
+    Increment,
+    Decrement,
+    TTL,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 struct Claims {
-    pub sub: String,
-    pub iss: String,
-    pub iat: i64,
-    pub exp: i64,
+    sub: String,
+    iss: String,
+    iat: i64,
+    exp: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PatchValue {
+    operation: Operation,
+    value: Option<String>,
 }
 
 /// The main Client
@@ -133,7 +150,11 @@ impl LucidClient {
 
     /// Store a string or bytes as a value for a key. Creates a new key if it does not exist
     #[throws]
-    pub async fn put_raw<K: AsRef<str>, V: Into<Body>>(&self, key: K, value: V) -> PutStatus {
+    pub async fn put_raw<K: AsRef<str> + ?Sized, V: Into<Body>>(
+        &self,
+        key: &K,
+        value: V,
+    ) -> PutStatus {
         let res = self
             .client
             .put(self.key_url(key)?)
@@ -153,7 +174,7 @@ impl LucidClient {
 
     /// Gets raw bytes from a key's value
     #[throws]
-    pub async fn get_raw<K: AsRef<str>>(&self, key: K) -> Option<Bytes> {
+    pub async fn get_raw<K: AsRef<str> + ?Sized>(&self, key: &K) -> Option<Bytes> {
         let res = self
             .client
             .get(self.key_url(key)?)
@@ -170,7 +191,7 @@ impl LucidClient {
 
     /// Delete a key's value. Returns `true` if the key existed and was actually deleted
     #[throws]
-    pub async fn delete<K: AsRef<str>>(&self, key: K) -> bool {
+    pub async fn delete<K: AsRef<str> + ?Sized>(&self, key: &K) -> bool {
         let res = self
             .client
             .delete(self.key_url(key)?)
@@ -188,7 +209,7 @@ impl LucidClient {
 
     /// Check if a key exists
     #[throws]
-    pub async fn exists<K: AsRef<str>>(&self, key: K) -> bool {
+    pub async fn exists<K: AsRef<str> + ?Sized>(&self, key: &K) -> bool {
         let res = self
             .client
             .head(self.key_url(key)?)
@@ -206,7 +227,7 @@ impl LucidClient {
 
     /// Serialize a rust object and store as the value for a key
     #[throws]
-    pub async fn put<K: AsRef<str>, V: Serialize>(&self, key: K, value: &V) -> PutStatus {
+    pub async fn put<K: AsRef<str> + ?Sized, V: Serialize>(&self, key: &K, value: &V) -> PutStatus {
         self.put_raw(
             key,
             serde_mod::to_vec(value).map_err(|_| Error::SerializeError)?,
@@ -216,13 +237,96 @@ impl LucidClient {
 
     /// Get the value for a key and deserialize it into a rust object
     #[throws]
-    pub async fn get<K: AsRef<str>, V: DeserializeOwned>(&self, key: K) -> Option<V> {
+    pub async fn get<K: AsRef<str> + ?Sized, V: DeserializeOwned>(&self, key: &K) -> Option<V> {
         let bytes = self.get_raw(key).await?;
         match bytes {
             None => None,
             Some(bytes) => {
                 Some(serde_mod::from_slice(bytes.as_ref()).map_err(|_| Error::DeserializeError)?)
             }
+        }
+    }
+
+    /// Lock a key. Returns `false` if the key is already locked and `true` otherwise
+    #[throws]
+    pub async fn lock<K: AsRef<str> + ?Sized>(&self, key: &K) -> bool {
+        match self
+            .patch(key, &PatchValue::new(Operation::Lock, None))
+            .await
+        {
+            Ok(_) => true,
+            Err(err) => match err {
+                Error::Conflict => false,
+                err => throw!(err),
+            },
+        }
+    }
+
+    /// Unlock a key. Returns `false` if the key is already unlocked and `true` otherwise
+    #[throws]
+    pub async fn unlock<K: AsRef<str> + ?Sized>(&self, key: &K) -> bool {
+        match self
+            .patch(key, &PatchValue::new(Operation::Unlock, None))
+            .await
+        {
+            Ok(_) => true,
+            Err(err) => match err {
+                Error::Conflict => false,
+                err => throw!(err),
+            },
+        }
+    }
+
+    /// Increment a key. Note the key's value must be like `b"0"` otherwise this will throw an
+    /// [Error::NonNumericValue]
+    #[throws]
+    pub async fn increment<K: AsRef<str> + ?Sized>(&self, key: &K) {
+        self.patch(key, &PatchValue::new(Operation::Increment, None))
+            .await
+            .map_err(|err| match err {
+                Error::BadRequest => Error::NonNumericValue,
+                err => err,
+            })?
+    }
+
+    /// Decrement a key. See [LucidClient::increment] for more info.
+    #[throws]
+    pub async fn decrement<K: AsRef<str> + ?Sized>(&self, key: &K) {
+        self.patch(key, &PatchValue::new(Operation::Decrement, None))
+            .await
+            .map_err(|err| match err {
+                Error::BadRequest => Error::NonNumericValue,
+                err => err,
+            })?
+    }
+
+    /// Add a "time to live" constraint to a key
+    #[throws]
+    pub async fn ttl<K: AsRef<str> + ?Sized>(&self, key: &K, duration: Duration) {
+        self.patch(
+            key,
+            &PatchValue::new(Operation::TTL, Some(duration.as_secs().to_string())),
+        )
+        .await?
+    }
+
+    #[throws]
+    async fn patch<K: AsRef<str> + ?Sized>(&self, key: &K, value: &PatchValue) {
+        let res = self
+            .client
+            .patch(self.key_url(key)?)
+            .headers(self.authorization()?)
+            .body(serde_json::to_string(&value).map_err(|_| Error::SerializeError)?)
+            .send()
+            .await
+            .map_err(Error::InvalidRequest)?;
+        match res.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => (),
+            StatusCode::NOT_FOUND => throw!(Error::NotFound),
+            StatusCode::CONFLICT => throw!(Error::Conflict),
+            StatusCode::BAD_REQUEST => throw!(Error::BadRequest),
+            StatusCode::UNAUTHORIZED => throw!(Error::Unauthorized),
+            _ => throw!(Error::InvalidResponse),
         }
     }
 
@@ -269,9 +373,40 @@ impl LucidClient {
     }
 }
 
+impl Operation {
+    #[inline]
+    fn as_str(self) -> &'static str {
+        match self {
+            Operation::Lock => "lock",
+            Operation::Unlock => "unlock",
+            Operation::Increment => "increment",
+            Operation::Decrement => "decrement",
+            Operation::TTL => "ttl",
+        }
+    }
+}
+
+impl PatchValue {
+    #[inline]
+    fn new(operation: Operation, value: Option<String>) -> Self {
+        Self { operation, value }
+    }
+}
+
+impl Serialize for Operation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serde::Deserialize;
 
     #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
     struct TestStruct {
@@ -400,7 +535,100 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "serde")]
+    #[tokio::test]
+    async fn lock_unlock() -> Result<(), Error> {
+        let client = client()?;
+        let key = "lock_unlock";
+
+        client.put_raw(key, "value").await?;
+        assert!(!client.unlock(key).await?);
+        assert!(client.lock(key).await?);
+        assert!(!client.lock(key).await?);
+        assert!(client.unlock(key).await?);
+        assert!(!client.unlock(key).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_lock() -> Result<(), Error> {
+        let client = client()?;
+        let key = "missing_lock";
+
+        assert!(matches!(client.unlock(key).await, Err(Error::NotFound)));
+        assert!(matches!(client.lock(key).await, Err(Error::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn increment_decrement() -> Result<(), Error> {
+        let client = client()?;
+        let key = "increment_decrement";
+
+        client.put_raw(key, "0").await?;
+        assert_eq!(
+            "0",
+            String::from_utf8_lossy(client.get_raw(key).await?.unwrap().as_ref())
+        );
+        client.increment(key).await?;
+        assert_eq!(
+            "1",
+            String::from_utf8_lossy(client.get_raw(key).await?.unwrap().as_ref())
+        );
+        client.decrement(key).await?;
+        assert_eq!(
+            "0",
+            String::from_utf8_lossy(client.get_raw(key).await?.unwrap().as_ref())
+        );
+        client.decrement(key).await?;
+        assert_eq!(
+            "-1",
+            String::from_utf8_lossy(client.get_raw(key).await?.unwrap().as_ref())
+        );
+        client.increment(key).await?;
+        assert_eq!(
+            "0",
+            String::from_utf8_lossy(client.get_raw(key).await?.unwrap().as_ref())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_numeric_increment_decrement() -> Result<(), Error> {
+        let client = client()?;
+        let key = "non_numeric_increment_decrement";
+
+        client.put_raw(key, "cool").await?;
+        println!("{:?}", client.increment(key).await);
+        assert!(matches!(
+            client.increment(key).await,
+            Err(Error::NonNumericValue)
+        ));
+        assert!(matches!(
+            client.decrement(key).await,
+            Err(Error::NonNumericValue)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ttl() -> Result<(), Error> {
+        let client = client()?;
+        let key = "ttl";
+
+        client.put_raw(key, "cool").await?;
+        client.ttl(key, Duration::from_secs(3)).await?;
+        assert_eq!(
+            "cool",
+            String::from_utf8_lossy(client.get_raw(key).await?.unwrap().as_ref())
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn put() -> Result<(), Error> {
         let client = client()?;
@@ -413,7 +641,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "serde")]
     #[tokio::test]
     async fn get() -> Result<(), Error> {
         let client = client()?;
