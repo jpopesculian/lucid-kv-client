@@ -1,6 +1,4 @@
 //! A simple Client for the Lucid KV
-//!
-//! Notifications are still experimental
 
 #[macro_use]
 extern crate failure;
@@ -541,6 +539,7 @@ where
 mod tests {
     use super::*;
 
+    use futures::stream::StreamExt;
     use serde::Deserialize;
 
     #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -796,6 +795,56 @@ mod tests {
         client.health_check().await?;
         let client = LucidClient::new("http://localhost:9999")?;
         assert!(client.health_check().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notifications_raw() -> Result<(), Error> {
+        let client = client()?;
+        let key = "notifications_raw";
+        client.put_raw(key, "value1").await?;
+        let mut stream = client
+            .clone()
+            .notifications_raw(|err| RetryPolicy::ForwardError(err))
+            .await?;
+        let (next, _) = tokio::join!(stream.next(), client.put_raw(key, "value2"));
+        assert_eq!(
+            next.unwrap().unwrap(),
+            Notification {
+                key: key.to_string(),
+                data: "value2".into()
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notifications() -> Result<(), Error> {
+        let client = client()?;
+        let key = "notifications";
+        let test_value1 = TestStruct {
+            a: 1,
+            b: "value1".to_string(),
+            c: vec![1, 2, 3],
+        };
+        let test_value2 = TestStruct {
+            a: 2,
+            b: "value2".to_string(),
+            c: vec![4, 5, 6],
+        };
+        client.put(key, &test_value1).await?;
+        let mut stream = client
+            .clone()
+            .notifications(|err| RetryPolicy::ForwardError(err))
+            .await?;
+        let (next, _) = tokio::join!(stream.next(), client.put(key, &test_value2));
+        assert_eq!(
+            next.unwrap().unwrap(),
+            Notification {
+                key: key.to_string(),
+                data: test_value2
+            }
+        );
         Ok(())
     }
 }
