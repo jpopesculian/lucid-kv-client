@@ -148,6 +148,22 @@ impl LucidClient {
         Builder::new(base_url)
     }
 
+    /// Health check
+    #[throws]
+    pub async fn health_check(&self) {
+        let url = self.url.join("health").map_err(|_| Error::InvalidUrl)?;
+        let res = self
+            .client
+            .head(url)
+            .send()
+            .await
+            .map_err(Error::InvalidRequest)?;
+        match res.status() {
+            StatusCode::OK => (),
+            _ => throw!(Error::InvalidResponse),
+        }
+    }
+
     /// Store a string or bytes as a value for a key. Creates a new key if it does not exist
     #[throws]
     pub async fn put_raw<K: AsRef<str> + ?Sized, V: Into<Body>>(
@@ -652,6 +668,15 @@ mod tests {
         client.put("get", &test_value).await?;
         let db_value = client.get("get").await?;
         assert_eq!(Some(test_value), db_value);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_check() -> Result<(), Error> {
+        let client = client()?;
+        client.health_check().await?;
+        let client = LucidClient::new("http://localhost:9999")?;
+        assert!(client.health_check().await.is_err());
         Ok(())
     }
 }
