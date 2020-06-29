@@ -1,6 +1,6 @@
 //! A simple Client for the Lucid KV
 //!
-//! Notifications currently unsupported
+//! Notifications are still experimental
 
 #[macro_use]
 extern crate failure;
@@ -8,11 +8,18 @@ extern crate failure;
 #[macro_use]
 extern crate fehler;
 
+pub use futures_retry::{ErrorHandler, RetryPolicy};
+
 use bytes::Bytes;
+use futures::future;
+use futures::{Stream, TryStreamExt};
+use futures_retry::StreamRetryExt;
 use jsonwebtoken::EncodingKey;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::{Body, Client, ClientBuilder, StatusCode, Url};
+use reqwest_eventsource::{Error as EventsourceError, RequestBuilderExt};
 use serde::{de::DeserializeOwned, ser::Serializer, Serialize};
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 cfg_if::cfg_if! {
@@ -55,6 +62,18 @@ pub enum Error {
     InvalidJWTKey,
 }
 
+/// Errors when retrieving Notifications
+#[derive(Fail, Debug)]
+pub enum NotificationError<E>
+where
+    E: fmt::Display + fmt::Debug + Send + Sync + 'static,
+{
+    #[fail(display = "transport error after {} attempts: {}", _1, _0)]
+    Other(E, usize),
+    #[fail(display = "deserialize error")]
+    DeserializeError(Bytes),
+}
+
 /// Whether a Key was created or not
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -84,6 +103,20 @@ struct Claims {
 struct PatchValue {
     operation: Operation,
     value: Option<String>,
+}
+
+struct NotificationsErrorHandler<F>
+where
+    F: ErrorHandler<reqwest::Error>,
+{
+    inner: F,
+}
+
+/// A notification sent when a key value pair is changed
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Notification<T> {
+    pub key: String,
+    pub data: T,
 }
 
 /// The main Client
@@ -326,6 +359,62 @@ impl LucidClient {
         .await?
     }
 
+    /// Get raw notification blobs
+    #[throws]
+    pub async fn notifications_raw<F, E>(
+        &self,
+        handler: F,
+    ) -> impl Stream<Item = Result<Notification<Bytes>, NotificationError<E>>>
+    where
+        F: ErrorHandler<reqwest::Error, OutError = E>,
+        E: fmt::Display + fmt::Debug + Send + Sync + 'static,
+    {
+        let url = self
+            .url
+            .join("notifications")
+            .map_err(|_| Error::InvalidUrl)?;
+        self.client
+            .get(url)
+            .headers(self.authorization()?)
+            .eventsource()
+            .unwrap()
+            .retry(NotificationsErrorHandler::new(handler))
+            .map_ok(|(event, _attempt)| Notification {
+                key: percent_encoding::percent_decode_str(&event.event.unwrap())
+                    .decode_utf8_lossy()
+                    .to_string(),
+                data: event.data.into(),
+            })
+            .map_err(|(err, usize)| NotificationError::Other(err, usize))
+    }
+
+    /// Get notifications and deserialize them into objects
+    #[throws]
+    pub async fn notifications<F, T, E>(
+        &self,
+        handler: F,
+    ) -> impl Stream<Item = Result<Notification<T>, NotificationError<E>>>
+    where
+        F: ErrorHandler<reqwest::Error, OutError = E>,
+        E: fmt::Display + fmt::Debug + Send + Sync + 'static,
+        T: DeserializeOwned,
+    {
+        self.notifications_raw(handler)
+            .await?
+            .and_then(|notification| {
+                future::ready(
+                    serde_mod::from_slice(&notification.data)
+                        .map_err(|_| NotificationError::DeserializeError(notification.data.clone()))
+                        .and_then(|data| {
+                            Ok(Notification {
+                                key: notification.key,
+                                data,
+                            })
+                        }),
+                )
+            })
+    }
+
     #[throws]
     async fn patch<K: AsRef<str> + ?Sized>(&self, key: &K, value: &PatchValue) {
         let res = self
@@ -415,6 +504,36 @@ impl Serialize for Operation {
         S: Serializer,
     {
         serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<F> NotificationsErrorHandler<F>
+where
+    F: ErrorHandler<reqwest::Error>,
+{
+    fn new(inner: F) -> Self {
+        Self { inner }
+    }
+}
+
+impl<F> ErrorHandler<EventsourceError<reqwest::Error>> for NotificationsErrorHandler<F>
+where
+    F: ErrorHandler<reqwest::Error>,
+{
+    type OutError = F::OutError;
+
+    fn handle(
+        &mut self,
+        attempt: usize,
+        err: EventsourceError<reqwest::Error>,
+    ) -> RetryPolicy<Self::OutError> {
+        match err {
+            EventsourceError::Parse(_) => {
+                // ignore all parsing errors
+                RetryPolicy::Repeat
+            }
+            EventsourceError::Transport(err) => self.inner.handle(attempt, err),
+        }
     }
 }
 
