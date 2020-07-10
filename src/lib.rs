@@ -274,7 +274,11 @@ impl LucidClient {
 
     /// Serialize a rust object and store as the value for a key
     #[throws]
-    pub async fn put<K: AsRef<str> + ?Sized, V: Serialize>(&self, key: &K, value: &V) -> PutStatus {
+    pub async fn put<K: AsRef<str> + ?Sized, V: Serialize + ?Sized>(
+        &self,
+        key: &K,
+        value: &V,
+    ) -> PutStatus {
         self.put_raw(
             key,
             serde_mod::to_vec(value).map_err(|_| Error::SerializeError)?,
