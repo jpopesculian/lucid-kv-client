@@ -6,6 +6,9 @@ extern crate failure;
 #[macro_use]
 extern crate fehler;
 
+#[macro_use]
+extern crate lazy_static;
+
 pub use futures_retry::{ErrorHandler, RetryPolicy};
 
 use bytes::Bytes;
@@ -30,6 +33,15 @@ cfg_if::cfg_if! {
 
 #[cfg(feature = "rustls-tls")]
 pub use reqwest::Certificate;
+
+lazy_static! {
+    static ref URL_SET: percent_encoding::AsciiSet = percent_encoding::CONTROLS
+        .add(b'/')
+        .add(b'#')
+        .add(b' ')
+        .add(b'?')
+        .add(b'%');
+}
 
 /// Errors when doing Client operations
 #[derive(Fail, Debug)]
@@ -440,9 +452,7 @@ impl LucidClient {
     #[inline]
     #[throws]
     fn key_url<K: AsRef<str>>(&self, key: K) -> Url {
-        let encoded =
-            percent_encoding::utf8_percent_encode(key.as_ref(), percent_encoding::NON_ALPHANUMERIC)
-                .to_string();
+        let encoded = percent_encoding::utf8_percent_encode(key.as_ref(), &URL_SET).to_string();
         self.url
             .join(&format!("api/kv/{}", encoded))
             .map_err(|_| Error::InvalidUrl)?
